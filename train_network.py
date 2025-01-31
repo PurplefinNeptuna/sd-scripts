@@ -1131,6 +1131,10 @@ class NetworkTrainer:
                 vae_name = os.path.basename(vae_name)
             metadata["ss_vae_name"] = vae_name
 
+        if args.todo_factor:
+            metadata["ss_todo_factor"] = args.todo_factor
+            metadata["ss_todo_max_depth"] = args.todo_max_depth
+
         metadata = {k: str(v) for k, v in metadata.items()}
 
         # make minimum metadata for filtering
@@ -1487,7 +1491,7 @@ class NetworkTrainer:
 
                     for timestep in validation_timesteps:
                         args.min_timestep = args.max_timestep = timestep
-
+                        args.max_timestep += 1
                         # temporary, for batch processing
                         self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype)
 

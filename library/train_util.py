@@ -83,6 +83,7 @@ from library.sdxl_lpw_stable_diffusion import SdxlStableDiffusionLongPromptWeigh
 import library.model_util as model_util
 import library.huggingface_util as huggingface_util
 import library.sai_model_spec as sai_model_spec
+from library import token_downsampling
 import library.deepspeed_utils as deepspeed_utils
 from library.utils import setup_logging, pil_resize
 
@@ -4013,6 +4014,20 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         help="The Huber loss scale parameter. Only used if one of the huber loss modes (huber or smooth l1) is selected with loss_type. default is 1.0"
         " / Huber損失のスケールパラメータ。loss_typeがhuberまたはsmooth l1の場合に有効。デフォルトは1.0",
     )
+    parser.add_argument(
+        "--todo_factor",
+        type=float,
+        nargs="+",
+        help="token downsampling (ToDo) factor > 1 (recommend around 2-4). Specify multiple to set factor for each depth",
+    )
+    parser.add_argument(
+        "--todo_max_depth",
+        type=int,
+        choices=[1, 2, 3, 4],
+        help=(
+            "apply ToDo to deeper layers (lower quality for slight speed increase). SDXL only accepts 2 and 3. Recommend 1 or 2. Default 1 (or 2 for SDXL)"
+        ),
+    )
 
     parser.add_argument(
         "--lowram",
@@ -5468,6 +5483,12 @@ def load_target_model(args, weight_dtype, accelerator, unet_use_linear_projectio
 
             clean_memory_on_device(accelerator.device)
         accelerator.wait_for_everyone()
+
+    # apply token merging patch
+    if args.todo_factor:
+        token_downsampling.apply_patch(unet, args)
+        logger.info(f"enable token downsampling optimization: downsample_factor={args.todo_factor}, max_depth={args.todo_max_depth}")
+
     return text_encoder, vae, unet, load_stable_diffusion_format
 
 
