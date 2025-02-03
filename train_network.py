@@ -1355,6 +1355,8 @@ class NetworkTrainer:
                         accelerator, args, None, global_step, accelerator.device, vae, tokenizers, text_encoder, unet
                     )
 
+                    clean_memory_on_device(accelerator.device)
+
                     # 指定ステップごとにモデルを保存
                     if args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0:
                         accelerator.wait_for_everyone()
@@ -1571,6 +1573,8 @@ class NetworkTrainer:
 
             self.sample_images(accelerator, args, epoch + 1, global_step, accelerator.device, vae, tokenizers, text_encoder, unet)
             optimizer_train_fn()
+
+            clean_memory_on_device(accelerator.device)
 
             # end of epoch
 
