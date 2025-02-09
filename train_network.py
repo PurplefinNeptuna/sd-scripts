@@ -309,7 +309,10 @@ class NetworkTrainer:
     ) -> torch.nn.Module:
         return accelerator.prepare(unet)
 
-    def on_step_start(self, args, accelerator, network, text_encoders, unet, batch, weight_dtype):
+    def on_step_start(self, args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train: bool = True):
+        pass
+
+    def on_validation_step_end(self, args, accelerator, network, text_encoders, unet, batch, weight_dtype):
         pass
 
     # endregion
@@ -1282,7 +1285,7 @@ class NetworkTrainer:
         original_args_min_timestep = args.min_timestep
         original_args_max_timestep = args.max_timestep
 
-        def get_rng_state() -> tuple[torch.ByteTensor, Optional[torch.ByteTensor], tuple]:
+        def switch_rng_state(seed: int) -> tuple[torch.ByteTensor, Optional[torch.ByteTensor], tuple]:
             cpu_rng_state = torch.get_rng_state()
             if accelerator.device.type == "cuda":
                 gpu_rng_state = torch.cuda.get_rng_state()
@@ -1293,9 +1296,13 @@ class NetworkTrainer:
             else:
                 gpu_rng_state = None
             python_rng_state = random.getstate()
+
+            torch.manual_seed(seed)
+            random.seed(seed)
+
             return (cpu_rng_state, gpu_rng_state, python_rng_state)
 
-        def set_rng_state(rng_states: tuple[torch.ByteTensor, Optional[torch.ByteTensor], tuple]):
+        def restore_rng_state(rng_states: tuple[torch.ByteTensor, Optional[torch.ByteTensor], tuple]):
             cpu_rng_state, gpu_rng_state, python_rng_state = rng_states
             torch.set_rng_state(cpu_rng_state)
             if gpu_rng_state is not None:
@@ -1330,8 +1337,8 @@ class NetworkTrainer:
                 with accelerator.accumulate(training_model):
                     on_step_start_for_network(text_encoder, unet)
 
-                    # temporary, for batch processing
-                    self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype)
+                    # preprocess batch for each model
+                    self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=True)
 
                     loss = self.process_batch(
                         batch,
@@ -1422,8 +1429,7 @@ class NetworkTrainer:
                 if accelerator.sync_gradients and validation_steps > 0 and should_validate_step:
                     optimizer_eval_fn()
                     accelerator.unwrap_model(network).eval()
-                    rng_states = get_rng_state()
-                    torch.manual_seed(args.validation_seed if args.validation_seed is not None else args.seed)
+                    rng_states = switch_rng_state(args.validation_seed if args.validation_seed is not None else args.seed)
 
                     val_progress_bar = tqdm(
                         range(validation_total_steps),
@@ -1437,8 +1443,7 @@ class NetworkTrainer:
                             break
 
                         for timestep in validation_timesteps:
-                            # temporary, for batch processing
-                            self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype)
+                            self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=False)
 
                             args.min_timestep = args.max_timestep = timestep  # dirty hack to change timestep
 
@@ -1474,6 +1479,7 @@ class NetworkTrainer:
                                 }
                                 accelerator.log(logs, step=global_step)
 
+                            self.on_validation_step_end(args, accelerator, network, text_encoders, unet, batch, weight_dtype)
                             val_ts_step += 1
 
                     if is_tracking:
@@ -1484,7 +1490,7 @@ class NetworkTrainer:
                         }
                         accelerator.log(logs, step=global_step)
 
-                    set_rng_state(rng_states)
+                    restore_rng_state(rng_states)
                     args.min_timestep = original_args_min_timestep
                     args.max_timestep = original_args_max_timestep
                     optimizer_train_fn()
@@ -1501,8 +1507,7 @@ class NetworkTrainer:
             if should_validate_epoch and len(val_dataloader) > 0:
                 optimizer_eval_fn()
                 accelerator.unwrap_model(network).eval()
-                rng_states = get_rng_state()
-                torch.manual_seed(args.validation_seed if args.validation_seed is not None else args.seed)
+                rng_states = switch_rng_state(args.validation_seed if args.validation_seed is not None else args.seed)
 
                 val_progress_bar = tqdm(
                     range(validation_total_steps),
@@ -1520,7 +1525,7 @@ class NetworkTrainer:
                         args.min_timestep = args.max_timestep = timestep
                         args.max_timestep += 1
                         # temporary, for batch processing
-                        self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype)
+                        self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=False)
 
                         loss = self.process_batch(
                             batch,
@@ -1555,6 +1560,7 @@ class NetworkTrainer:
                             }
                             accelerator.log(logs, step=global_step)
 
+                        self.on_validation_step_end(args, accelerator, network, text_encoders, unet, batch, weight_dtype)
                         val_ts_step += 1
 
                 if is_tracking:
@@ -1567,7 +1573,7 @@ class NetworkTrainer:
                     }
                     accelerator.log(logs, step=global_step)
 
-                set_rng_state(rng_states)
+                restore_rng_state(rng_states)
                 args.min_timestep = original_args_min_timestep
                 args.max_timestep = original_args_max_timestep
                 optimizer_train_fn()
