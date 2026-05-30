@@ -1142,6 +1142,27 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ileco_loss_weight", type=float, default=1.0, help="loss multiplier for iLECO")
     parser.add_argument("--ileco_min_sigma", type=float, default=None, help="minimum sigma for iLECO timestep sampling")
     parser.add_argument("--ileco_max_sigma", type=float, default=None, help="maximum sigma for iLECO timestep sampling")
+    # Missing iLECO arguments (from anima_train_leco.py)
+    parser.add_argument(
+        "--ileco_guidance_scale",
+        type=float,
+        default=1.0,
+        help="scale the iLECO target direction: original_base + scale * (target_base - original_base)",
+    )
+    parser.add_argument(
+        "--ileco_denoising_steps",
+        type=int,
+        default=0,
+        help="optional partial denoising steps before iLECO teacher/student prediction",
+    )
+    parser.add_argument(
+        "--ileco_denoise_guidance_scale",
+        type=float,
+        default=1.0,
+        help="guidance scale for iLECO partial denoising",
+    )
+    parser.add_argument("--ileco_resolution", type=int, default=512, help="default iLECO training resolution")
+    parser.add_argument("--ileco_batch_size", type=int, default=1, help="default iLECO batch size")
     parser.add_argument("--add_reverse_pairs", action="store_true", help="add reverse iLECO prompt pairs")
     parser.add_argument("--reverse_multiplier", type=float, default=-1.0, help="LoRA multiplier for reverse iLECO pairs")
     parser.add_argument("--reverse_weight", type=float, default=1.0, help="loss weight for reverse iLECO pairs")
