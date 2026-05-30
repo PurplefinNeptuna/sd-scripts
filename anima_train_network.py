@@ -595,6 +595,84 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
 
         return noisy_model_input.to(dtype), timesteps.to(dtype), sigmas
 
+    def predict_velocity_for_ileco(
+        self,
+        anima: anima_models.Anima,
+        noisy_model_input: torch.Tensor,
+        timesteps: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        attn_mask: torch.Tensor,
+        t5_input_ids: torch.Tensor,
+        t5_attn_mask: torch.Tensor,
+        padding_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Predict velocity using iLECO cached text encoder conditions.
+        
+        This is the iLECO equivalent of predict_velocity_anima() from anima_leco_train_util.py,
+        adapted to work with the tensor format from repeat_ileco_text_encoder_conds().
+        
+        Accepts either 4D (B, C, H, W) or 5D (B, C, 1, H, W) input and always returns 4D.
+        
+        IMPORTANT: This method does NOT control gradient computation. The caller's context
+        manager (torch.no_grad() or torch.enable_grad()) determines whether gradients are computed.
+        This allows the teacher/student pattern where teacher runs in no_grad and student runs with grad.
+        """
+        input_is_5d = noisy_model_input.ndim == 5
+        if not input_is_5d:
+            noisy_model_input = noisy_model_input.unsqueeze(2)
+        # Do NOT wrap with torch.set_grad_enabled - respect the caller's context
+        model_pred = anima(
+            noisy_model_input,
+            timesteps,
+            prompt_embeds,
+            padding_mask=padding_mask,
+            target_input_ids=t5_input_ids,
+            target_attention_mask=t5_attn_mask,
+            source_attention_mask=attn_mask,
+        )
+        return model_pred.squeeze(2)
+
+    def _partial_denoising_step(
+        self,
+        anima: anima_models.Anima,
+        latents: torch.Tensor,
+        sigmas: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        attn_mask: torch.Tensor,
+        t5_input_ids: torch.Tensor,
+        t5_attn_mask: torch.Tensor,
+        padding_mask: torch.Tensor,
+        guidance_scale: float = 1.0,
+    ) -> torch.Tensor:
+        """Run partial denoising steps using flow matching.
+        
+        Mirrors diffusion_anima() from anima_leco_train_util.py but works with
+        raw tensor conditions from repeat_ileco_text_encoder_conds().
+        
+        Accepts 4D latents (B, C, H, W) and returns 4D latents.
+        """
+        current_latents = latents.clone()
+        bs = current_latents.shape[0]
+        for step_index in range(len(sigmas) - 1):
+            sigma = sigmas[step_index]
+            next_sigma = sigmas[step_index + 1]
+
+            # sigma is a 0-D tensor; expand to 1-D batch dimension for anima()
+            timestep_1d = sigma.expand(bs)
+
+            # Predict velocity at current sigma
+            model_pred = self.predict_velocity_for_ileco(
+                anima, current_latents, timestep_1d,
+                prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask,
+                padding_mask,
+            )
+
+            # Euler step: update latents
+            current_latents = current_latents + model_pred * (next_sigma - sigma)
+            current_latents = current_latents.to(dtype=sigmas.dtype)
+
+        return current_latents
+
     def get_ileco_noise_pred_and_target(
         self,
         args,
@@ -606,6 +684,13 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         weight_dtype,
         is_train=True,
     ):
+        """Get noise prediction and target for iLECO training.
+        
+        This implements the iLECO training algorithm:
+        1. Optional partial denoising toward original prompt
+        2. Compute target = original_base + guidance_scale * (target_base - original_base)
+        3. Train network to predict target using original prompt conditions
+        """
         anima: anima_models.Anima = unet
 
         if self.ileco_text_encoder_conds is None:
@@ -655,28 +740,64 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
 
         old_multiplier = getattr(network, "multiplier", 1.0)
         try:
+            # Step 1: Optional partial denoising toward original prompt
+            current_noisy_input = noisy_model_input
+            if args.ileco_denoising_steps > 0:
+                logger.info(f"Running {args.ileco_denoising_steps} partial denoising steps with guidance_scale={args.ileco_denoise_guidance_scale}")
+                denoise_sigmas = torch.linspace(1.0, 0.0, args.ileco_denoising_steps + 1, device=accelerator.device, dtype=weight_dtype)
+                
+                network.set_multiplier(0.0)
+                with torch.no_grad(), accelerator.autocast():
+                    current_noisy_input = self._partial_denoising_step(
+                        anima,
+                        current_noisy_input.squeeze(2),
+                        denoise_sigmas,
+                        original_prompt_embeds,
+                        original_attn_mask,
+                        original_t5_input_ids,
+                        original_t5_attn_mask,
+                        padding_mask,
+                        guidance_scale=args.ileco_denoise_guidance_scale,
+                    ).unsqueeze(2)
+
+            # Step 2: Compute target using guidance scale formula
+            # target = original_base + ileco_guidance_scale * (target_base - original_base)
             network.set_multiplier(0.0)
             with torch.no_grad(), accelerator.autocast():
-                target = anima(
-                    noisy_model_input,
-                    timesteps,
-                    target_prompt_embeds,
-                    padding_mask=padding_mask,
-                    target_input_ids=target_t5_input_ids,
-                    target_attention_mask=target_t5_attn_mask,
-                    source_attention_mask=target_attn_mask,
-                )
-
-            network.set_multiplier(pair_conds["multiplier"])
-            with torch.set_grad_enabled(is_train), accelerator.autocast():
-                model_pred = anima(
-                    noisy_model_input,
+                original_base = self.predict_velocity_for_ileco(
+                    anima,
+                    current_noisy_input,
                     timesteps,
                     original_prompt_embeds,
-                    padding_mask=padding_mask,
-                    target_input_ids=original_t5_input_ids,
-                    target_attention_mask=original_t5_attn_mask,
-                    source_attention_mask=original_attn_mask,
+                    original_attn_mask,
+                    original_t5_input_ids,
+                    original_t5_attn_mask,
+                    padding_mask,
+                )
+                target_base = self.predict_velocity_for_ileco(
+                    anima,
+                    current_noisy_input,
+                    timesteps,
+                    target_prompt_embeds,
+                    target_attn_mask,
+                    target_t5_input_ids,
+                    target_t5_attn_mask,
+                    padding_mask,
+                )
+                target = original_base + args.ileco_guidance_scale * (target_base - original_base)
+
+            # Step 3: Student prediction with network enabled
+            network.set_multiplier(pair_conds["multiplier"])
+            with torch.set_grad_enabled(is_train), accelerator.autocast():
+                model_pred = self.predict_velocity_for_ileco(
+                    anima,
+                    current_noisy_input,
+                    timesteps,
+                    original_prompt_embeds,
+                    original_attn_mask,
+                    original_t5_input_ids,
+                    original_t5_attn_mask,
+                    padding_mask,
                 )
         finally:
             network.set_multiplier(old_multiplier)
@@ -1078,6 +1199,9 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             metadata["ss_reverse_weight"] = args.reverse_weight
             metadata["ss_ileco_min_sigma"] = args.ileco_min_sigma
             metadata["ss_ileco_max_sigma"] = args.ileco_max_sigma
+            metadata["ss_ileco_guidance_scale"] = args.ileco_guidance_scale
+            metadata["ss_ileco_denoising_steps"] = args.ileco_denoising_steps
+            metadata["ss_ileco_denoise_guidance_scale"] = args.ileco_denoise_guidance_scale
         metadata["ss_addift"] = args.addift
         if args.addift:
             metadata["ss_addift_loss_weight"] = args.addift_loss_weight

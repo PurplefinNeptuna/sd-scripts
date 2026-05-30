@@ -153,8 +153,9 @@ CMD+=(
     "--log_with" "tensorboard"
     "--logging_dir" "logs"
     "--save_every_n_steps=$SAVE_EVERY_N_STEPS"
-    "--ileco_guidance_scale=5.0"
-    "--ileco_denoising_steps=4"
+    "--ileco_guidance_scale=3.0"
+    "--ileco_min_sigma=0.2"
+    "--ileco_max_sigma=0.8"
 )
 
 # ============================================================
